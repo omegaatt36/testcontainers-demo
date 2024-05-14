@@ -3,6 +3,8 @@ package user
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -10,63 +12,79 @@ import (
 type Limiter struct {
 	client *redis.Client
 
-	key             string
-	maxTokens       int
-	tokensPerSecond int
-
-	script string
+	limit         int
+	limitPeriod   time.Duration // 1 hour for limitPeriod
+	counterWindow time.Duration // 1 minute for example, 1/60 of the period
 }
 
-func NewLimiter(client *redis.Client, key string, maxTokens, tokensPerSecond int) *Limiter {
-	script := `
-local bucket = KEYS[1]
-local maxTokens = tonumber(ARGV[1])
-local refillRate = tonumber(ARGV[2])
-local period = 1  -- 一秒鐘
-local lastRefillTimeKey = bucket .. ':lastRefillTime'
-local tokensKey = bucket .. ':tokens'
-
-local currentTime = tonumber(redis.call('time')[1])
-local lastRefillTime = tonumber(redis.call('get', lastRefillTimeKey) or currentTime)
-local elapsed = currentTime - lastRefillTime
-
-local currentTokens = tonumber(redis.call('get', tokensKey) or maxTokens)
-
-if elapsed >= period then
-	local newTokens = math.min(maxTokens, refillRate * math.floor(elapsed / period))
-	currentTokens = math.min(maxTokens, currentTokens + newTokens)
-	redis.call('set', tokensKey, currentTokens)
-	redis.call('set', lastRefillTimeKey, currentTime)
-end
-
-if currentTokens > 0 then
-	redis.call('decr', tokensKey)
-	return 1
-else
-	return 0
-end
-	`
-
+// 新建一個滑窗限流器
+func NewLimiter(client *redis.Client, limit int, period, expiry time.Duration) *Limiter {
 	return &Limiter{
-		client:          client,
-		key:             key,
-		maxTokens:       maxTokens,
-		tokensPerSecond: tokensPerSecond,
-		script:          script,
+		client: client,
+
+		limit:         limit,
+		limitPeriod:   period,
+		counterWindow: expiry,
 	}
 }
 
-func (limiter *Limiter) RequestToken(ctx context.Context) bool {
-	if limiter == nil {
-		return false
-	}
+func (r *Limiter) AllowRequest(ctx context.Context, key string, incr int) error {
+	now := time.Now()
+	timestamp := fmt.Sprint(now.Truncate(r.counterWindow).Unix())
 
-	res, err := limiter.client.Eval(ctx, limiter.script, []string{limiter.key},
-		limiter.maxTokens, limiter.tokensPerSecond).Result()
+	val, err := r.client.HIncrBy(ctx, key, timestamp, int64(incr)).Result()
 	if err != nil {
-		fmt.Println("Error executing script:", err)
-		return false
+		return err
 	}
 
-	return res.(int64) == 1
+	if val >= int64(r.limit) {
+		return ErrRateLimitExceeded(0, r.limit, r.limitPeriod, now.Add(r.limitPeriod))
+	}
+
+	r.client.Expire(ctx, key, r.limitPeriod)
+
+	result, err := r.client.HGetAll(ctx, key).Result()
+	if err != nil {
+		return err
+	}
+
+	threshold := fmt.Sprint(now.Add(-r.limitPeriod).Unix())
+
+	total := 0
+	for k, v := range result {
+		if k > threshold {
+			i, _ := strconv.Atoi(v)
+			total += i
+		} else {
+			r.client.HDel(ctx, key, k)
+		}
+	}
+
+	if total >= int(r.limit) {
+		return ErrRateLimitExceeded(0, r.limit, r.limitPeriod, now.Add(r.limitPeriod))
+	}
+
+	return nil
+}
+
+type RateLimitExceeded struct {
+	Remaining int
+	Limit     int
+	Period    time.Duration
+	Reset     time.Time
+}
+
+func ErrRateLimitExceeded(remaining int, limit int, period time.Duration, reset time.Time) error {
+	return RateLimitExceeded{
+		Remaining: remaining,
+		Limit:     limit,
+		Period:    period,
+		Reset:     reset,
+	}
+}
+
+func (e RateLimitExceeded) Error() string {
+	return fmt.Sprintf(
+		"rate limit of %d per %v has been exceeded and resets at %v",
+		e.Limit, e.Period, e.Reset)
 }

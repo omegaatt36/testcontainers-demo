@@ -3,6 +3,7 @@ package user_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/omegaatt36/limiter/cache"
 	"github.com/omegaatt36/limiter/user"
@@ -17,19 +18,19 @@ type LimiterTestSuite struct {
 	suite.Suite
 }
 
-func (s *LimiterTestSuite) testLimiter(limiter *user.Limiter) {
-	ctx := context.Background()
-	for i := 0; i < 10; i++ {
-		s.True(limiter.RequestToken(ctx))
-	}
-}
-
 func (s *LimiterTestSuite) TestLimiterWithRealConn() {
 	client := cache.NewRedisClient()
 
-	limiter := user.NewLimiter(client, "globalTokenBucket", 10, 10)
+	limiter := user.NewLimiter(client, 10, time.Second*5, time.Second)
 
-	s.testLimiter(limiter)
+	ctx := context.Background()
+
+	for i := range 9 {
+		s.NoError(limiter.AllowRequest(ctx, "55688", 1), "request %d should be allowed", i+1)
+		time.Sleep(time.Millisecond)
+	}
+
+	s.Error(limiter.AllowRequest(ctx, "55688", 1), "request  should be denied")
 }
 
 func (s *LimiterTestSuite) TestLimiterWithTestContainers() {
@@ -54,9 +55,14 @@ func (s *LimiterTestSuite) TestLimiterWithTestContainers() {
 		Addr: endpoint,
 	})
 
-	limiter := user.NewLimiter(client, "globalTokenBucket2", 10, 10)
+	limiter := user.NewLimiter(client, 10, time.Second*5, time.Second)
 
-	s.testLimiter(limiter)
+	for i := range 9 {
+		s.NoError(limiter.AllowRequest(ctx, "55688", 1), "request %d should be allowed", i+1)
+		time.Sleep(time.Millisecond)
+	}
+
+	s.Error(limiter.AllowRequest(ctx, "55688", 1), "request should be denied")
 }
 
 func TestLimiter(t *testing.T) {
